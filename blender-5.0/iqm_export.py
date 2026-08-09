@@ -4,7 +4,7 @@ bl_info = {
     "name": "Export Inter-Quake Model (.iqm/.iqe)",
     "author": "Lee Salzman",
     "version": (2025, 7, 24),
-    "blender": (4, 1, 0),
+    "blender": (5, 0, 0),
     "location": "File > Export > Inter-Quake Model",
     "description": "Export to the Inter-Quake Model format (.iqm/.iqe)",
     "warning": "",
@@ -746,6 +746,12 @@ def collectAnim(context, armature, scale, bones, action, startframe = None, endf
     scene = context.scene
     worldmatrix = armature.matrix_world
     armature.animation_data.action = action
+    # Blender 4.4+ requires explicit slot binding; assignment alone
+    # may leave the armature unanimated without raising an error.
+    anim_data = armature.animation_data
+    if hasattr(anim_data, "action_suitable_slots") and anim_data.action_suitable_slots:
+        anim_data.action_slot = anim_data.action_suitable_slots[0]
+        
     outdata = []
     for time in range(startframe, endframe+1):
         scene.frame_set(time)
@@ -772,56 +778,87 @@ def collectAnim(context, armature, scale, bones, action, startframe = None, endf
         outdata.append(outframe)
     return outdata
 
-
-def collectAnims(context, armature, scale, bones, animspecs):
+# find animations from armature
+def collectAnimsAuto(context, armature, scale, bones):
     if not armature.animation_data:
-        print('Armature has no animation data')
+        print("Armature has no animation data")
         return []
-    actions = bpy.data.actions
-    animspecs = [ spec.strip() for spec in animspecs.split(',') ]
+
     anims = []
     scene = context.scene
+    fps = float(scene.render.fps)
+
+    # store initial states to restore later
     oldaction = armature.animation_data.action
     oldframe = scene.frame_current
-    for animspec in animspecs:
-        animspec = [ arg.strip() for arg in animspec.split(':') ]
-        animname = animspec[0]
-        if animname not in actions:
-            print('Action "%s" not found in current armature' % animname)
-            continue
-        try:
-            startframe = int(animspec[1])
-        except:
-            startframe = None
-        try:
-            endframe = int(animspec[2])
-        except:
-            endframe = None
-        try:
-            fps = float(animspec[3])
-        except:
-            fps = float(scene.render.fps)
-        try:
-            flags = int(animspec[4])
-        except:
-            flags = 0
-        framedata = collectAnim(context, armature, scale, bones, actions[animname], startframe, endframe)
-        anims.append(Animation(animname, framedata, fps, flags))
+
+    processed_actions = set()
+
+    # parse NLA Tracks and Strips assigned to this specific armature
+    if armature.animation_data.nla_tracks:
+        for track in armature.animation_data.nla_tracks:
+            for strip in track.strips:
+                if strip.action and strip.action.name not in processed_actions:
+                    action = strip.action
+
+                    # verify active frame range flags
+                    if getattr(action, "use_frame_range", False):
+                        start = int(action.frame_start)
+                        end = int(action.frame_end)
+                    else:
+                        # fallback to NLA track limits
+                        start = int(strip.action_frame_start)
+                        end = int(strip.action_frame_end)
+
+                    framedata = collectAnim(
+                        context, armature, scale, bones, action, start, end
+                    )
+                    anims.append(Animation(action.name, framedata, fps, 0))
+                    processed_actions.add(action.name)
+
+    # parse the currently active action if not processed via NLA
+    if armature.animation_data.action:
+        action = armature.animation_data.action
+        if action.name not in processed_actions:
+            if getattr(action, "use_frame_range", False):
+                start = int(action.frame_start)
+                end = int(action.frame_end)
+            else:
+                # fallback to absolute action range
+                start, end = [int(f) for f in action.frame_range]
+
+            framedata = collectAnim(context, armature, scale, bones, action, start, end)
+            anims.append(Animation(action.name, framedata, fps, 0))
+            processed_actions.add(action.name)
+
+    # restore initial states
     armature.animation_data.action = oldaction
     scene.frame_set(oldframe)
-    return anims
 
+    return anims
  
-def collectMeshes(context, bones, scale, matfun, useskel = True, usecol = False, usemods = False, filetype = 'IQM', namedmaterialmeshes = False):
+def collectMeshes(context, bones, scale, matfun, usecol = False, usemods = False, filetype = 'IQM', namedmaterialmeshes = False):
     vertwarn = []
     objs = context.selected_objects #context.scene.objects
     meshes = []
+    # check Depsgraph once
+    dg = context.evaluated_depsgraph_get()
     for obj in objs:
         if obj.type == 'MESH':
-            dg = context.evaluated_depsgraph_get()
-            data = obj.evaluated_get(dg).to_mesh(preserve_all_data_layers=True, depsgraph=dg) if usemods else obj.original.to_mesh(preserve_all_data_layers=True, depsgraph=dg)
+            # rewrited to clear the mesh
+            obj_eval = None
+            if usemods:
+                # get the obj and creates temp mesh
+                obj_eval = obj.evaluated_get(dg)
+                data = obj_eval.to_mesh(preserve_all_data_layers=True, depsgraph=dg)
+            else:
+                # get original mesh
+                data = obj.data
             if not data.polygons:
+                if obj_eval:
+                    obj_eval.to_mesh_clear()
                 continue
+
             coordmatrix = obj.matrix_world
             normalmatrix = coordmatrix.inverted_safe().transposed()
             if scale != 1.0:
@@ -833,17 +870,14 @@ def collectMeshes(context, bones, scale, matfun, useskel = True, usecol = False,
             colors = None
             alpha = None
             if usecol:
-                if data.vertex_colors.active:
-                    if data.vertex_colors.active.name.startswith('alpha'):
-                        alpha = data.vertex_colors.active.data
+                # vertex_colors.active -> color_attributes.active_color
+                if data.color_attributes:
+                    if data.color_attributes.active_color.name.startswith("alpha"):
+                        alpha = data.color_attributes.active_color.data
                     else:
-                        colors = data.vertex_colors.active.data
-                for layer in data.vertex_colors:
-                    if layer.name.startswith('alpha'):
-                        if not alpha:
-                            alpha = layer.data
-                    elif not colors:
-                        colors = layer.data
+                        colors = data.color_attributes.active_color.data
+                
+                # Legacy vertex_colors loop removed for Blender 4.0+ compatibility
             if data.materials:
                 for idx, mat in enumerate(data.materials):
                     if not mat:
@@ -884,11 +918,12 @@ def collectMeshes(context, bones, scale, matfun, useskel = True, usecol = False,
                     v = data.vertices[loop.vertex_index]
                     vertco = coordmatrix @ v.co
 
-                    if not face.use_smooth: 
-                        vertno = mathutils.Vector(face.normal)
-                    else:
-                        vertno = mathutils.Vector(loop.normal)
-                    vertno = normalmatrix @ vertno
+                    # 4.1 -> 5.0+ adaptation
+                    # Mesh.corner_normals unifies flat/smooth/custom-split normal resolution;
+                    # no need to branch on face.use_smooth.
+                    vertno = normalmatrix @ mathutils.Vector(
+                        data.corner_normals[loopidx].vector
+                    )
                     vertno.normalize()
 
                     # flip V axis of texture space
@@ -912,7 +947,7 @@ def collectMeshes(context, bones, scale, matfun, useskel = True, usecol = False,
                             vertcol = (255, 255, 255, int(round(vertalpha[0] * 255.0)))
 
                     vertweights = []
-                    if useskel:
+                    if bones:
                         for g in v.groups:
                             try:
                                 vertweights.append((g.weight, bones[groups[g.group].name].index))
@@ -921,15 +956,6 @@ def collectMeshes(context, bones, scale, matfun, useskel = True, usecol = False,
                                     vertwarn.append((groups[g.group].name, mesh.name))
                                     print('Vertex depends on non-existent bone: %s in mesh: %s' % (groups[g.group].name, mesh.name))
 
-                    if not face.use_smooth:
-                        vertindex = len(verts)
-                        vertkey = Vertex(vertindex, vertco, vertno, vertuv, vertweights, vertcol)
-                        if filetype == 'IQM':
-                            vertkey.normalizeWeights()
-                        mesh.verts.append(vertkey)
-                        faceverts.append(vertkey)
-                        continue    
-                        
                     vertkey = Vertex(v.index, vertco, vertno, vertuv, vertweights, vertcol)
                     if filetype == 'IQM':
                         vertkey.normalizeWeights()
@@ -952,10 +978,16 @@ def collectMeshes(context, bones, scale, matfun, useskel = True, usecol = False,
                 for i in range(2, len(faceverts)):
                     mesh.tris.append((faceverts[0], faceverts[i], faceverts[i-1])) 
             # Export materials in the order of their assigned index
-            for i in range(len(matnames)):
+            # is now possible to export objects without material
+            max_mat_index = max(len(matnames), 1)
+            for i in range(max_mat_index):
                 mesh = materials.get((obj.name, i))
                 if mesh:
                     meshes.append(mesh)
+
+            # RAM clearance for each obj
+            if obj_eval:
+                obj_eval.to_mesh_clear()
  
     for mesh in meshes:
         mesh.optimize()
@@ -1024,21 +1056,14 @@ def exportIQE(file, meshes, bones, anims):
     file.write('\n')
 
 
-def exportIQM(context, filename, usemesh = True, usemods = False, useskel = True, usebbox = True, usecol = False, scale = 1.0, animspecs = None, matfun = (lambda prefix, image: image), derigify = False, boneorder = None, namedmaterialmeshes = False):
+def exportIQM(context, filename, filetype="IQM", usemesh = True, usemods = False, usebbox = True, usecol = False, scale = 1.0, matfun = (lambda prefix, image: image), derigify = False, boneorder = None, namedmaterialmeshes = False):
     armature = findArmature(context)
-    if useskel and not armature:
-        print('No armature selected')
-        return
+    # removed "useskel" - auto detects if exists an armature
+    has_armature = armature is not None
+    
+    # removed: change the extension in the menu
 
-    if filename.lower().endswith('.iqm'):
-        filetype = 'IQM'
-    elif filename.lower().endswith('.iqe'):
-        filetype = 'IQE'
-    else:
-        print('Unknown file type: %s' % filename)
-        return
-
-    if useskel:
+    if has_armature:
         if derigify:
             bones = derigifyBones(context, armature, scale)
         else:
@@ -1068,15 +1093,16 @@ def exportIQM(context, filename, usemesh = True, usemods = False, useskel = True
 
     bonelist = sorted(bones.values(), key = lambda bone: bone.index)
     if usemesh:
-        meshes = collectMeshes(context, bones, scale, matfun, useskel, usecol, usemods, filetype, namedmaterialmeshes)
+        meshes = collectMeshes(context, bones, scale, matfun, usecol, usemods, filetype, namedmaterialmeshes)
     else:
         meshes = []
 
     if armature:
         poseArmature(context, armature, oldpose)
 
-    if useskel and animspecs:
-        anims = collectAnims(context, armature, scale, bonelist, animspecs)
+    if has_armature:
+        # automatic animation detection
+        anims = collectAnimsAuto(context, armature, scale, bonelist)
     else:
         anims = []
 
@@ -1111,11 +1137,22 @@ class ExportIQM(bpy.types.Operator, bpy_extras.io_utils.ExportHelper):
     '''Export an Inter-Quake Model IQM or IQE file'''
     bl_idname = "export.iqm"
     bl_label = 'Export IQM'
-    filename_ext = ".iqm"
-    animspec: bpy.props.StringProperty(name="Animations", description="Animations to export", maxlen=1024, default="")
+    bl_options = {"REGISTER"}
+    filename_ext = ""
+    # IQM or IQE selector
+    file_format: bpy.props.EnumProperty(
+        name="Format",
+        description="Choose export format",
+        items=(
+            ("IQM", "IQM (.iqm)", "Export as binary IQM"),
+            ("IQE", "IQE (.iqe)", "Export as text IQE"),
+        ),
+        default="IQM",
+    )
+    # animspec: no longer needed
     usemesh: bpy.props.BoolProperty(name="Meshes", description="Generate meshes", default=True)
     usemods: bpy.props.BoolProperty(name="Modifiers", description="Apply modifiers", default=True)
-    useskel: bpy.props.BoolProperty(name="Skeleton", description="Generate skeleton", default=True)
+    # useskel: no longer needed
     usebbox: bpy.props.BoolProperty(name="Bounding boxes", description="Generate bounding boxes", default=True)
     usecol: bpy.props.BoolProperty(name="Vertex colors", description="Export vertex colors", default=False)
     usescale: bpy.props.FloatProperty(name="Scale", description="Scale of exported model", default=1.0, min=0.0, step=50, precision=2)
@@ -1132,13 +1169,17 @@ class ExportIQM(bpy.types.Operator, bpy_extras.io_utils.ExportHelper):
             matfun = lambda prefix, image: prefix
         else:
             matfun = lambda prefix, image: image
-        exportIQM(context, self.properties.filepath, self.properties.usemesh, self.properties.usemods, self.properties.useskel, self.properties.usebbox, self.properties.usecol, self.properties.usescale, self.properties.animspec, matfun, self.properties.derigify, self.properties.boneorder, self.properties.namedmaterialmeshes)
+        exportIQM(context, self.properties.filepath, self.properties.file_format, self.properties.usemesh, self.properties.usemods, self.properties.usebbox, self.properties.usecol, self.properties.usescale, matfun, self.properties.derigify, self.properties.boneorder, self.properties.namedmaterialmeshes)
         return {'FINISHED'}
 
     def check(self, context):
-        filepath = bpy.path.ensure_ext(self.filepath, '.iqm')
-        filepathalt = bpy.path.ensure_ext(self.filepath, '.iqe')
-        if filepath != self.filepath and filepathalt != self.filepath:
+        # adapted to new menu selection
+        ext = ".iqm" if self.file_format == "IQM" else ".iqe"
+        filepath = self.filepath
+        if filepath.endswith((".iqm", ".iqe")):
+            filepath = filepath[:-4]
+        filepath = bpy.path.ensure_ext(filepath, ext)
+        if filepath != self.filepath:
             self.filepath = filepath
             return True
         return False
@@ -1154,8 +1195,9 @@ def register():
     bpy.types.TOPBAR_MT_file_export.append(menu_func)
 
 def unregister():
-    bpy.utils.unregister_class(ExportIQM)
+    # reverse unregister
     bpy.types.TOPBAR_MT_file_export.remove(menu_func)
+    bpy.utils.unregister_class(ExportIQM)
 
 
 if __name__ == "__main__":
